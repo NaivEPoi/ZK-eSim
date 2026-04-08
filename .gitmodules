@@ -1,0 +1,12 @@
+[submodule "ZK-eSIM_applet"]
+	path = ZK-eSIM_applet
+	url = https://github.com/NaivEPoi/ZK-eSIM_applet.git
+[submodule "OpenEUICC"]
+	path = OpenEUICC
+	url = https://github.com/NaivEPoi/OpenEUICC_ZK.git
+[submodule "lpac"]
+	path = lpac
+	url = https://github.com/NaivEPoi/lpac_ZK.git
+[submodule "pysim"]
+	path = pysim
+	url = https://github.com/NaivEPoi/pysim_ZK.git
