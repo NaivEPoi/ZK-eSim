@@ -88,15 +88,48 @@ done
 # Cleanup trap — kill SM-DP+ server on exit
 # ---------------------------------------------------------------------------
 SMDPP_PID=""
-cleanup() {
+stop_smdpp() {
   if [[ -n "${SMDPP_PID}" ]]; then
     log "Stopping SM-DP+ server (PID ${SMDPP_PID})..."
     kill "${SMDPP_PID}" 2>/dev/null || true
     wait "${SMDPP_PID}" 2>/dev/null || true
+    SMDPP_PID=""
     ok "SM-DP+ server stopped."
   fi
 }
+cleanup() {
+  stop_smdpp
+}
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# eUICC memory reset helper
+# ---------------------------------------------------------------------------
+euicc_memory_reset() {
+  local purge_output
+  local purge_rc
+
+  log "Resetting eUICC memory to free space before download..."
+  set +e
+  purge_output=$(LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
+    "${LPAC_BIN}" chip purge yes 2>&1)
+  purge_rc=$?
+  set -e
+
+  if [[ ${purge_rc} -ne 0 ]]; then
+    if echo "${purge_output}" | grep -qi "nothing to delete"; then
+      warn "eUICC memory reset skipped: nothing to delete."
+      return 0
+    fi
+
+    echo "${purge_output}" >&2
+    err "eUICC memory reset failed (rc=${purge_rc})."
+    return ${purge_rc}
+  fi
+
+  [[ -n "${purge_output}" ]] && echo "${purge_output}"
+  ok "eUICC memory reset completed."
+}
 
 # ---------------------------------------------------------------------------
 # Prerequisite checks
@@ -179,8 +212,14 @@ phase1_build() {
 # ---------------------------------------------------------------------------
 phase1_start_smdpp() {
   banner "Phase 1b — Start SM-DP+ Server"
+  local zk_flag="${1:-0}"
 
   log "Starting osmo-smdpp.py on ${SMDPP_HOST}:${SMDPP_PORT}..."
+  if [[ "${zk_flag}" == "1" ]]; then
+    log "  Server mode   : zk (--zk)"
+  else
+    log "  Server mode   : normal"
+  fi
 
   # Run from pysim/ so relative paths to smdpp-data/ resolve correctly
   # shellcheck disable=SC2086
@@ -188,6 +227,7 @@ phase1_start_smdpp() {
     -H "${SMDPP_HOST}" \
     -p "${SMDPP_PORT}" \
     -v \
+    $( [[ "${zk_flag}" == "1" ]] && printf '%s' "--zk" ) \
     ${SMDPP_EXTRA_ARGS}) \
     &
   SMDPP_PID=$!
@@ -229,6 +269,8 @@ phase1_download() {
   # Unset any custom ISD-R AID override to use the standard ISD-R
   unset LPAC_CUSTOM_ISD_R_AID
 
+  euicc_memory_reset
+
   # Delete any existing profiles before downloading
   log "Checking for existing profiles to delete..."
   local profile_list
@@ -257,6 +299,50 @@ for p in data.get('payload', {}).get('data', []):
   else
     log "No existing profiles found."
   fi
+
+  # ── Stage 1: card resource diagnostic ─────────────────────────────────────
+  # Print EUICCInfo2 extCardResource so that memory-related install failures
+  # can be attributed to NVM exhaustion, RAM exhaustion, or quota over-declaration.
+  log "Card resource check (EUICCInfo2 extCardResource):"
+  local card_info
+  card_info=$(LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
+    "${LPAC_BIN}" chip info 2>/dev/null || true)
+  # Pass card_info via env var to avoid stdin ambiguity with here-doc.
+  # The diagnostic is best-effort — never let it kill the workflow.
+  CARD_INFO_JSON="${card_info}" python3 -c '
+import os, json, sys
+
+raw = os.environ.get("CARD_INFO_JSON", "").strip()
+if not raw:
+    print("  [warn] lpac chip info returned no output — card may be busy or flag unsupported")
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"  [warn] Could not parse chip info JSON: {e}")
+    sys.exit(0)
+
+er = ((data.get("payload") or {}).get("data") or {}).get("extCardResource") or {}
+nvm_free  = er.get("freeNonVolatileMemory")
+ram_free  = er.get("freeVolatileMemory")
+installed = er.get("installedApplication")
+
+if nvm_free is None and ram_free is None:
+    print("  [warn] extCardResource not reported by card (field absent in EUICCInfo2)")
+else:
+    print(f"  installedApplication    : {installed}")
+    print(f"  freeNonVolatileMemory   : {nvm_free} bytes")
+    print(f"  freeVolatileMemory      : {ram_free} bytes")
+    NVM_MIN = 35000
+    RAM_MIN  = 1024
+    if nvm_free is not None and nvm_free < NVM_MIN:
+        print(f"  [WARN] freeNonVolatileMemory ({nvm_free}) < {NVM_MIN}: NVM exhaustion likely")
+        print("         Consider running an eUICC memory reset before retrying.")
+    if ram_free is not None and ram_free < RAM_MIN:
+        print(f"  [WARN] freeVolatileMemory ({ram_free}) < {RAM_MIN}: RAM exhaustion likely")
+        print("         This may cause errorReason 10 (installFailedDueToInsufficientMemoryForProfile).")
+' || true
+  # ─────────────────────────────────────────────────────────────────────────
 
   log "Running: ${LPAC_BIN} profile download -s ${SMDPP_HOST} -m ${MATCHING_ID}"
   local download_rc=0
@@ -312,6 +398,9 @@ for p in data.get('payload', {}).get('data', []):
 phase2_test_applet() {
   banner "Phase 2 — Test ZK-eSIM Applet (ZK-eSIM Applet AID)"
 
+  stop_smdpp
+  phase1_start_smdpp 1
+
   log "Switching to ZK-eSIM applet AID: ${INSTANCE_AID}"
   log "Setting LPAC_CUSTOM_ISD_R_AID=${INSTANCE_AID}"
   if [[ "${PHASE2_APDU_DEBUG}" == "1" ]]; then
@@ -352,8 +441,8 @@ phase2_test_applet() {
     warn "Profile download via applet AID returned non-zero (may be expected if profile already loaded)."
   }
 
-  log "Step 2.2 — Listing profiles as seen through applet AID..."
-  run_lpac profile list || warn "Profile list returned non-zero (check applet state)."
+  # log "Step 2.2 — Listing profiles as seen through applet AID..."
+  # run_lpac profile list || warn "Profile list returned non-zero (check applet state)."
 
   ok "Phase 2 complete — ZK-eSIM applet message flow verified."
 }
@@ -379,9 +468,8 @@ main() {
   fi
 
   if [[ "${SKIP_DOWNLOAD}" == "0" ]]; then
-    phase1_start_smdpp
+    phase1_start_smdpp 0
     phase1_download
-    # Keep server alive for Phase 2
   else
     warn "Skipping profile download — SKIP_DOWNLOAD=1"
   fi

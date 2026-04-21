@@ -9,4 +9,4 @@
 	url = https://github.com/NaivEPoi/lpac_ZK.git
 [submodule "pysim"]
 	path = pysim
-	url = https://github.com/NaivEPoi/pysim_ZK.git
+	url = https://github.com/jhaworth21/ZK-eSIM-SMDP

@@ -280,7 +280,7 @@ lpac internally calls, in order:
 | `LPAC_APDU` | `pcsc` | 1, 2 | lpac APDU backend |
 | `LPAC_HTTP` | `curl` | 1, 2 | lpac HTTP backend |
 | `LPAC_CUSTOM_ISD_R_AID` | *(unset = default ISD-R)* | 2 | Override ISD-R AID for applet testing |
-| `LPAC_CUSTOM_ES10X_MSS` | `120` | 1, 2 | ES10 max APDU segment size (6–255) |
+| `LPAC_CUSTOM_ES10X_MSS` | `120` | 1, 2 | ES10 max APDU segment size (6–256) |
 | `LPAC_APDU_DEBUG` | `false` | 1, 2 | Log raw APDU bytes |
 | `LPAC_HTTP_DEBUG` | `false` | 1, 2 | Log raw HTTP traffic |
 
