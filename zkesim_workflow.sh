@@ -17,17 +17,14 @@
 #   SMDPP_HOST           SM-DP+ bind host (default: testsmdpplus1.example.com)
 #   SMDPP_PORT           SM-DP+ bind port (default: 443)
 #   SMDPP_EXTRA_ARGS     Extra args passed to osmo-smdpp.py (default: none)
-#   MNO_HOST             MNO bind/URL host used only when ZK_DOWNLOAD=1 (default: localhost)
-#   MNO_PORT             MNO bind port (default: 4443)
-#   MNO_EXTRA_ARGS       Extra args passed to mno-server.py (default: none)
-#   MNO_CACERT           MNO CA cert path for lpac (default: pysim/smdpp-data/certs/MNO/CERT_MNO_TLS_NIST.pem)
-#   MNO_SKIP             Set to 1 to skip starting the MNO server
-#   ZK_DOWNLOAD          Set to 0 to make the second/applet-targeted download legacy too
-#   LPAC_BUILD_DIR       lpac CMake build directory (default: lpac/build)
 #   LPAC_BIN             Path to lpac binary (default: auto-detected)
 #   LPAC_APDU            APDU backend (default: pcsc)
 #   LPAC_HTTP            HTTP backend (default: curl)
 #   PHASE2_APDU_DEBUG    Set to 1 to print raw APDU trace in Phase 2 (default: 1)
+#   ZK_DOWNLOAD          Set to 1 to use ZK profile download via lpac zk-download (default: 0)
+#                        Phase 0 (RegisterAndIssue + CertInit) runs automatically in the ZK path.
+#   MNO_HOST             MNO server host — defaults to SMDPP_HOST (co-located)
+#   MNO_PORT             MNO server port — defaults to SMDPP_PORT (co-located)
 #   SKIP_BUILD           Set to 1 to skip Phase 1 build step
 #   SKIP_DOWNLOAD        Set to 1 to skip profile download step
 
@@ -39,11 +36,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APPLET_DIR="${REPO_ROOT}/ZK-eSIM_applet"
 PYSIM_ROOT="${REPO_ROOT}/pysim"
-LPAC_BUILD_DIR="${LPAC_BUILD_DIR:-${REPO_ROOT}/lpac/build}"
-LPAC_BIN="${LPAC_BIN:-${LPAC_BUILD_DIR}/src/lpac}"
-LPAC_LIB_DIR="${LPAC_BUILD_DIR}:${LPAC_BUILD_DIR}/driver:${LPAC_BUILD_DIR}/utils:${LPAC_BUILD_DIR}/euicc"
-WORKDIR="${WORKDIR:-${REPO_ROOT}/.zkesim-workflow}"
-LOG_DIR="${LOG_DIR:-${WORKDIR}/logs}"
+LPAC_BIN="${LPAC_BIN:-${REPO_ROOT}/lpac/output/executables/lpac}"
+LPAC_LIB_DIR="${REPO_ROOT}/lpac/build:${REPO_ROOT}/lpac/build/driver:${REPO_ROOT}/lpac/build/utils:${REPO_ROOT}/lpac/build/euicc"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,15 +49,13 @@ INSTANCE_AID="${INSTANCE_AID:-D07002CA44900101}"
 SMDPP_HOST="${SMDPP_HOST:-testsmdpplus1.example.com}"
 SMDPP_PORT="${SMDPP_PORT:-443}"
 SMDPP_EXTRA_ARGS="${SMDPP_EXTRA_ARGS:-}"
-MNO_HOST="${MNO_HOST:-localhost}"
-MNO_PORT="${MNO_PORT:-4443}"
-MNO_EXTRA_ARGS="${MNO_EXTRA_ARGS:-}"
-MNO_CACERT="${MNO_CACERT:-${PYSIM_ROOT}/smdpp-data/certs/MNO/CERT_MNO_TLS_NIST.pem}"
-MNO_SKIP="${MNO_SKIP:-0}"
-ZK_DOWNLOAD="${ZK_DOWNLOAD:-1}"
 PHASE2_APDU_DEBUG="${PHASE2_APDU_DEBUG:-1}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
+ZK_DOWNLOAD="${ZK_DOWNLOAD:-0}"
+# MNO is co-located with SM-DP+; override only if running a separate MNO server.
+MNO_HOST="${MNO_HOST:-${SMDPP_HOST}}"
+MNO_PORT="${MNO_PORT:-${SMDPP_PORT}}"
 
 # Export lpac backend settings (used in both phases)
 export LPAC_APDU="${LPAC_APDU:-pcsc}"
@@ -85,18 +77,30 @@ banner() { echo -e "\n${BOLD}${CYAN}══════════════�
            echo -e "${BOLD}${CYAN}  $*${RESET}"; \
            echo -e "${BOLD}${CYAN}══════════════════════════════════════════════${RESET}\n"; }
 
-mkdir -p "${LOG_DIR}"
+# Returns current time in milliseconds (cross-platform: macOS + Linux).
+_ts_ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
 
-port_in_use() {
-  local port="$1"
-  ss -tlnp 2>/dev/null | grep -q ":${port} " || \
-    netstat -tlnp 2>/dev/null | grep -q ":${port} "
-}
+# ---------------------------------------------------------------------------
+# Phase timing accumulators (set during the ZK download path)
+# ---------------------------------------------------------------------------
+T_REGISTER_MS=0
+T_CERTINIT_MS=0
+T_ZK_DOWNLOAD_MS=0
 
-describe_port_listener() {
-  local port="$1"
-  ss -tlnp 2>/dev/null | grep ":${port} " || \
-    netstat -tlnp 2>/dev/null | grep ":${port} " || true
+print_timing_summary() {
+  local total=$(( T_REGISTER_MS + T_CERTINIT_MS + T_ZK_DOWNLOAD_MS ))
+  echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════${RESET}"
+  echo -e "${BOLD}${CYAN}  Timing Summary${RESET}"
+  echo -e "${BOLD}${CYAN}══════════════════════════════════════════════${RESET}"
+  printf "  %-36s %s\n" "Phase" "Wall-clock (ms)"
+  echo -e "  ──────────────────────────────────────────────"
+  printf "  %-36s %d ms\n" "Registration (BF44+BF45)"       "${T_REGISTER_MS}"
+  printf "  %-36s %d ms\n" "Certificate Init (BF46+BF47)"   "${T_CERTINIT_MS}"
+  printf "  %-36s %d ms\n" "ZK Profile Download (BF42+BF43)" "${T_ZK_DOWNLOAD_MS}"
+  echo -e "  ──────────────────────────────────────────────"
+  printf "  %-36s %d ms\n" "Total (ZK path)" "${total}"
+  echo -e "${BOLD}${CYAN}══════════════════════════════════════════════${RESET}\n"
+  log "Server-side per-handler latency is in: ${REPO_ROOT}/smdpp.log (grep '[timing]')"
 }
 
 # ---------------------------------------------------------------------------
@@ -106,6 +110,7 @@ for arg in "$@"; do
   case "$arg" in
     --skip-build)    SKIP_BUILD=1 ;;
     --skip-download) SKIP_DOWNLOAD=1 ;;
+    --zk-download)   ZK_DOWNLOAD=1 ;;
     --help|-h)
       sed -n '2,20p' "$0" | sed 's/^# \?//'
       exit 0
@@ -118,7 +123,27 @@ done
 # Cleanup trap — kill SM-DP+ server on exit
 # ---------------------------------------------------------------------------
 SMDPP_PID=""
-MNO_PID=""
+
+# Kill any process currently listening on a given TCP port.
+# Prevents "Address already in use" when a previous server wasn't cleaned up.
+_sweep_port() {
+  local port="$1"
+  local pids
+  pids=$(lsof -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null || true)
+  if [[ -n "${pids}" ]]; then
+    warn "Port ${port} already in use by PID(s): ${pids} — killing..."
+    echo "${pids}" | xargs kill 2>/dev/null || true
+    # Wait up to 2 s for the port to be released.
+    local i=4
+    while [[ ${i} -gt 0 ]]; do
+      sleep 0.5
+      lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 || break
+      i=$(( i - 1 ))
+    done
+    ok "Port ${port} cleared."
+  fi
+}
+
 stop_smdpp() {
   if [[ -n "${SMDPP_PID}" ]]; then
     log "Stopping SM-DP+ server (PID ${SMDPP_PID})..."
@@ -127,18 +152,10 @@ stop_smdpp() {
     SMDPP_PID=""
     ok "SM-DP+ server stopped."
   fi
-}
-stop_mno() {
-  if [[ -n "${MNO_PID}" ]]; then
-    log "Stopping MNO server (PID ${MNO_PID})..."
-    kill "${MNO_PID}" 2>/dev/null || true
-    wait "${MNO_PID}" 2>/dev/null || true
-    MNO_PID=""
-    ok "MNO server stopped."
-  fi
+  # Sweep any orphaned processes that slipped past PID tracking.
+  _sweep_port "${SMDPP_PORT}"
 }
 cleanup() {
-  stop_mno
   stop_smdpp
 }
 trap cleanup EXIT
@@ -182,13 +199,10 @@ check_prereqs() {
   [[ -d "${APPLET_DIR}" ]] || { err "ZK-eSIM_applet directory not found: ${APPLET_DIR}"; missing=1; }
   [[ -d "${PYSIM_ROOT}" ]] || { err "pysim directory not found: ${PYSIM_ROOT}"; missing=1; }
   [[ -f "${PYSIM_ROOT}/osmo-smdpp.py" ]] || { err "osmo-smdpp.py not found in ${PYSIM_ROOT}"; missing=1; }
-  if [[ "${ZK_DOWNLOAD}" != "0" ]]; then
-    [[ -f "${PYSIM_ROOT}/mno-server.py" ]] || { err "mno-server.py not found in ${PYSIM_ROOT}"; missing=1; }
-  fi
-  command -v python >/dev/null 2>&1 || { err "'python' not found. Activate the pysim environment before running this script."; missing=1; }
 
   if [[ "${SKIP_BUILD}" == "0" ]]; then
     command -v ant >/dev/null 2>&1 || { err "'ant' not found. Install Apache Ant."; missing=1; }
+    command -v python3 >/dev/null 2>&1 || { err "'python3' not found."; missing=1; }
     [[ -f "${PYSIM_ROOT}/contrib/saip-tool.py" ]] || { err "saip-tool.py not found in ${PYSIM_ROOT}/contrib/"; missing=1; }
   fi
 
@@ -210,10 +224,13 @@ phase0_build_lpac() {
   fi
 
   log "Configuring lpac..."
-  cmake -S "${REPO_ROOT}/lpac" -B "${LPAC_BUILD_DIR}"
+  (cd "${REPO_ROOT}/lpac" && cmake -B build -DSTANDALONE_MODE=ON)
 
   log "Building lpac (jobs=${jobs})..."
-  cmake --build "${LPAC_BUILD_DIR}" --target lpac -j "${jobs}"
+  (cd "${REPO_ROOT}/lpac" && cmake --build build -j "${jobs}")
+
+  log "Installing lpac..."
+  (cd "${REPO_ROOT}/lpac" && DESTDIR=output cmake --install build)
 
   if [[ ! -f "${LPAC_BIN}" ]]; then
     err "lpac binary missing after build: ${LPAC_BIN}"
@@ -258,6 +275,9 @@ phase1_start_smdpp() {
   banner "Phase 1b — Start SM-DP+ Server"
   local zk_flag="${1:-0}"
 
+  # Clear any stale server on the target port before starting a fresh one.
+  _sweep_port "${SMDPP_PORT}"
+
   log "Starting osmo-smdpp.py on ${SMDPP_HOST}:${SMDPP_PORT}..."
   if [[ "${zk_flag}" == "1" ]]; then
     log "  Server mode   : zk (--zk)"
@@ -265,38 +285,32 @@ phase1_start_smdpp() {
     log "  Server mode   : normal"
   fi
 
-  local smdpp_log="${LOG_DIR}/smdpp-${zk_flag}-$(date +%Y%m%d-%H%M%S).log"
-  log "  Log file      : ${smdpp_log}"
-
-  if port_in_use "${SMDPP_PORT}"; then
-    err "SM-DP+ port ${SMDPP_PORT} is already in use before startup."
-    describe_port_listener "${SMDPP_PORT}" >&2
-    err "Stop the stale listener before rerunning the workflow."
-    exit 1
-  fi
+  local smdpp_log="${REPO_ROOT}/smdpp.log"
+  log "SM-DP+ server log: ${smdpp_log}"
 
   # Run from pysim/ so relative paths to smdpp-data/ resolve correctly
   # shellcheck disable=SC2086
-  (cd "${PYSIM_ROOT}" && exec python osmo-smdpp.py \
+  (cd "${PYSIM_ROOT}" && python3 osmo-smdpp.py \
     -H "${SMDPP_HOST}" \
     -p "${SMDPP_PORT}" \
     -v \
     $( [[ "${zk_flag}" == "1" ]] && printf '%s' "--zk" ) \
     ${SMDPP_EXTRA_ARGS}) \
-    >"${smdpp_log}" 2>&1 \
-    &
+    >"${smdpp_log}" 2>&1 &
   SMDPP_PID=$!
 
   # Wait up to 10 s for the server to bind on its port
+  # Use lsof for cross-platform support (macOS + Linux); fall back to ss/netstat.
   local retries=20
   local ready=0
   while [[ ${retries} -gt 0 ]]; do
     if ! kill -0 "${SMDPP_PID}" 2>/dev/null; then
-      err "SM-DP+ server process exited unexpectedly."
-      err "SM-DP+ log: ${smdpp_log}"
+      err "SM-DP+ server process exited unexpectedly. Check ${smdpp_log} for details."
       exit 1
     fi
-    if port_in_use "${SMDPP_PORT}"; then
+    if lsof -iTCP:"${SMDPP_PORT}" -sTCP:LISTEN >/dev/null 2>&1 || \
+       ss -tlnp 2>/dev/null | grep -q ":${SMDPP_PORT} " || \
+       netstat -an 2>/dev/null | grep -q "[.:]${SMDPP_PORT} "; then
       ready=1
       break
     fi
@@ -305,76 +319,10 @@ phase1_start_smdpp() {
   done
 
   if [[ "${ready}" == "0" ]]; then
-    err "SM-DP+ server did not bind on port ${SMDPP_PORT} within 10 s."
-    err "SM-DP+ log: ${smdpp_log}"
+    err "SM-DP+ server did not bind on port ${SMDPP_PORT} within 10 s. Check ${smdpp_log} for details."
     exit 1
   fi
-  ok "SM-DP+ server running (PID ${SMDPP_PID})."
-}
-
-phase1_start_mno() {
-  if [[ "${ZK_DOWNLOAD}" == "0" ]]; then
-    warn "Skipping MNO server start — ZK_DOWNLOAD=0"
-    return 0
-  fi
-  if [[ "${MNO_SKIP}" == "1" ]]; then
-    warn "Skipping MNO server start — MNO_SKIP=1"
-    return 0
-  fi
-
-  banner "Phase 1b.2 — Start MNO Server"
-
-  local cert_gen="${PYSIM_ROOT}/smdpp-data/certs/MNO/gen_certs.sh"
-  if [[ -x "${cert_gen}" ]]; then
-    log "Ensuring MNO TLS certificate exists..."
-    (cd "$(dirname "${cert_gen}")" && bash ./gen_certs.sh >/dev/null 2>&1 || true)
-  else
-    warn "MNO certificate generator missing: ${cert_gen}"
-  fi
-
-  log "Starting mno-server.py on ${MNO_HOST}:${MNO_PORT}..."
-  local mno_log="${LOG_DIR}/mno-$(date +%Y%m%d-%H%M%S).log"
-  log "  Log file      : ${mno_log}"
-
-  if port_in_use "${MNO_PORT}"; then
-    err "MNO port ${MNO_PORT} is already in use before startup."
-    describe_port_listener "${MNO_PORT}" >&2
-    err "Stop the stale listener before rerunning the workflow."
-    exit 1
-  fi
-
-  # shellcheck disable=SC2086
-  (cd "${PYSIM_ROOT}" && exec python mno-server.py \
-    --host "${MNO_HOST}" \
-    --port "${MNO_PORT}" \
-    --smdp-url "https://${SMDPP_HOST}:${SMDPP_PORT}" \
-    ${MNO_EXTRA_ARGS}) \
-    >"${mno_log}" 2>&1 \
-    &
-  MNO_PID=$!
-
-  local retries=20
-  local ready=0
-  while [[ ${retries} -gt 0 ]]; do
-    if ! kill -0 "${MNO_PID}" 2>/dev/null; then
-      err "MNO server process exited unexpectedly."
-      err "MNO log: ${mno_log}"
-      exit 1
-    fi
-    if port_in_use "${MNO_PORT}"; then
-      ready=1
-      break
-    fi
-    sleep 0.5
-    retries=$((retries - 1))
-  done
-
-  if [[ "${ready}" == "0" ]]; then
-    err "MNO server did not bind on port ${MNO_PORT} within 10 s."
-    err "MNO log: ${mno_log}"
-    exit 1
-  fi
-  ok "MNO server running (PID ${MNO_PID})."
+  ok "SM-DP+ server running (PID ${SMDPP_PID}). Logs: ${smdpp_log}"
 }
 
 # ---------------------------------------------------------------------------
@@ -400,7 +348,7 @@ phase1_download() {
 
   local existing_iccids
   existing_iccids=$(echo "${profile_list}" \
-    | python -c "
+    | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for p in data.get('payload', {}).get('data', []):
@@ -430,7 +378,7 @@ for p in data.get('payload', {}).get('data', []):
     "${LPAC_BIN}" chip info 2>/dev/null || true)
   # Pass card_info via env var to avoid stdin ambiguity with here-doc.
   # The diagnostic is best-effort — never let it kill the workflow.
-  CARD_INFO_JSON="${card_info}" python -c '
+  CARD_INFO_JSON="${card_info}" python3 -c '
 import os, json, sys
 
 raw = os.environ.get("CARD_INFO_JSON", "").strip()
@@ -491,7 +439,7 @@ else:
 
   # Enable the newly-downloaded profile so its applets become selectable via AID.
   local new_iccid
-  new_iccid=$(echo "${profile_list_json}" | python -c "
+  new_iccid=$(echo "${profile_list_json}" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for p in data.get('payload', {}).get('data', []):
@@ -514,19 +462,264 @@ for p in data.get('payload', {}).get('data', []):
 }
 
 # ---------------------------------------------------------------------------
+# PHASE 1c (ZK path) — ZK profile download via lpac zk-download
+# ---------------------------------------------------------------------------
+phase1_zk_download() {
+  banner "Phase 1c — ZK Profile Download (lpac zk-download)"
+
+  local mno_addr="${MNO_HOST}:${MNO_PORT}"
+  log "MNO address (co-located SM-DP+) : ${mno_addr}"
+  log "SM-DP+ server                   : ${SMDPP_HOST}"
+
+  # Unset any custom ISD-R AID so zk-download targets the real ISD-R.
+  unset LPAC_CUSTOM_ISD_R_AID
+
+  euicc_memory_reset
+
+  log "Running: ${LPAC_BIN} profile zk-download -n ${mno_addr}"
+  local rc=0
+  set +e
+  LPAC_APDU="${LPAC_APDU}" \
+  LPAC_HTTP="${LPAC_HTTP}" \
+    "${LPAC_BIN}" profile zk-download \
+      -n "${mno_addr}"
+  rc=$?
+  set -e
+
+  if [[ "${rc}" != "0" ]]; then
+    err "ZK profile download failed (rc=${rc})."
+    exit 1
+  fi
+
+  ok "ZK profile download complete."
+
+  log "Verifying profile installation..."
+  local profile_list_json
+  profile_list_json=$(LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
+    "${LPAC_BIN}" profile list)
+  echo "${profile_list_json}"
+
+  local new_iccid
+  new_iccid=$(echo "${profile_list_json}" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for p in data.get('payload', {}).get('data', []):
+    if p.get('profileState') == 'disabled':
+        print(p['iccid'])
+        break
+" 2>/dev/null || true)
+
+  if [[ -n "${new_iccid}" ]]; then
+    log "Enabling profile ICCID ${new_iccid}..."
+    LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
+      "${LPAC_BIN}" profile enable "${new_iccid}" || \
+      warn "profile enable returned non-zero (may be OK if already enabled)."
+    ok "Profile ${new_iccid} enabled."
+  else
+    warn "No disabled profile found — assuming already enabled."
+  fi
+
+  ok "Phase 1 (ZK path) complete — profile installed in eUICC."
+}
+
+# ---------------------------------------------------------------------------
+# Helper: send a Phase 0 APDU via lpac and return the response hex
+# ---------------------------------------------------------------------------
+phase0_apdu() {
+  local tag="$1"   # BF44 / BF45 / BF46 / BF47
+  local payload_hex="$2"
+  # Build TLV: BF_TAG { 80 LL <payload> }
+  local payload_len_hex
+  payload_len_hex=$(printf '%02X' $((${#payload_hex} / 2)))
+  local tlv_hex="${tag}$(python3 -c "
+n = ${#payload_hex} // 2
+if n < 128:
+    print(f'{n:02X}')
+elif n < 256:
+    print(f'81{n:02X}')
+else:
+    print(f'82{n>>8:02X}{n&0xFF:02X}')
+")80${payload_len_hex}${payload_hex}"
+  # STORE DATA: 80 E2 91 00 LL <tlv>
+  local lc_hex
+  lc_hex=$(printf '%02X' $((${#tlv_hex} / 2)))
+  local apdu_hex="80E291000${lc_hex}${tlv_hex}"
+  log "Phase0 APDU TX: ${apdu_hex}"
+  local resp
+  resp=$(LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
+    LPAC_CUSTOM_ISD_R_AID="${INSTANCE_AID}" \
+    "${LPAC_BIN}" apdu "${apdu_hex}" 2>&1)
+  log "Phase0 APDU RX: ${resp}"
+  echo "${resp}"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: POST JSON to MNO endpoint, return response body
+# ---------------------------------------------------------------------------
+mno_post() {
+  local endpoint="$1"
+  local body="$2"
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    --data "${body}" \
+    "https://${MNO_HOST}:${MNO_PORT}${endpoint}" \
+    --insecure 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Phase 0 — RegisterAndIssue (BF44 + BF45)
+# ---------------------------------------------------------------------------
+phase0_register() {
+  banner "Phase 0.a — RegisterAndIssue (BF44 + BF45, blind Schnorr)"
+  log "MNO: ${MNO_HOST}:${MNO_PORT}"
+
+  # Leg 1: get MNO nonce commitment R_MNO = r_MNO·G
+  local challenge_resp
+  challenge_resp=$(mno_post "/zk-esim/v1/registerChallenge" "{}")
+  local request_id r_mno_b64
+  request_id=$(echo "${challenge_resp}" | python3 -c "import sys,json; print(json.load(sys.stdin)['requestId'])")
+  r_mno_b64=$(echo "${challenge_resp}"  | python3 -c "import sys,json; print(json.load(sys.stdin)['rMno'])")
+  local r_mno_hex
+  r_mno_hex=$(python3 -c "import base64; print(base64.b64decode('${r_mno_b64}').hex().upper())")
+  log "Got R_MNO (requestId=${request_id}): ${r_mno_hex}"
+
+  # Send BF44 { 80 R_MNO(65B) } to eUICC — computes blinded challenge e and π_auth
+  local bf44_resp
+  bf44_resp=$(phase0_apdu "44" "${r_mno_hex}")
+
+  # Parse BF44 response: field 80 = e (32B), field 81 = π_auth (DER)
+  local e_b64 pi_auth_b64
+  e_b64=$(echo "${bf44_resp}" | python3 -c "
+import sys, base64
+data = bytes.fromhex(sys.stdin.read().strip())
+pos = 0
+assert data[pos] == 0xBF and data[pos+1] == 0x44, 'Expected BF44'
+pos += 2
+l = data[pos]; pos += 1
+if l & 0x80: pos += l & 0x7F
+assert data[pos] == 0xA0, 'Expected A0'
+pos += 1; l = data[pos]; pos += 1
+if l & 0x80: pos += l & 0x7F
+assert data[pos] == 0x80, 'Expected 80 (e)'
+pos += 1; f0len = data[pos]; pos += 1
+print(base64.b64encode(data[pos:pos+f0len]).decode())
+")
+  pi_auth_b64=$(echo "${bf44_resp}" | python3 -c "
+import sys, base64
+data = bytes.fromhex(sys.stdin.read().strip())
+pos = 0
+assert data[pos] == 0xBF and data[pos+1] == 0x44
+pos += 2
+l = data[pos]; pos += 1
+if l & 0x80: pos += l & 0x7F
+assert data[pos] == 0xA0
+pos += 1; l = data[pos]; pos += 1
+if l & 0x80: pos += l & 0x7F
+pos += 1; f0len = data[pos]; pos += 1 + f0len   # skip field 80
+assert data[pos] == 0x81, 'Expected 81 (pi_auth)'
+pos += 1; f1len = data[pos]; pos += 1
+print(base64.b64encode(data[pos:pos+f1len]).decode())
+")
+  log "e      : ${e_b64}"
+  log "pi_auth: ${pi_auth_b64}"
+
+  # Leg 2: send blinded challenge e + π_auth to MNO, get partial sig s
+  local cred_resp s_b64
+  cred_resp=$(mno_post "/zk-esim/v1/registerCredential" \
+    "{\"requestId\":\"${request_id}\",\"e\":\"${e_b64}\",\"piAuth\":\"${pi_auth_b64}\"}")
+  s_b64=$(echo "${cred_resp}" | python3 -c "import sys,json; print(json.load(sys.stdin)['s'])")
+  local s_hex
+  s_hex=$(python3 -c "import base64; print(base64.b64decode('${s_b64}').hex().upper())")
+  log "s (partial sig): ${s_hex}"
+
+  # Send BF45 { 80 s(32B) } to eUICC — unblinds to σ_EID = R'||s'
+  local bf45_resp
+  bf45_resp=$(phase0_apdu "45" "${s_hex}")
+  echo "${bf45_resp}" | python3 -c "
+import sys; data = bytes.fromhex(sys.stdin.read().strip())
+assert data[0] == 0xBF and data[1] == 0x45 and data[3] == 0xA0, 'BF45 failed'
+print('OK')
+" && ok "Phase 0.a complete — σ_EID (blind Schnorr) stored in eUICC." || { err "Phase 0.a failed."; exit 1; }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 0 — CertInit (BF46 + BF47 combined in one server call)
+# ---------------------------------------------------------------------------
+phase0_certinit() {
+  banner "Phase 0.b — CertInit (BF46 + BF47)"
+  log "MNO: ${MNO_HOST}:${MNO_PORT}"
+
+  # Generate r_seed locally (32 random bytes)
+  local r_seed_hex r_seed_b64
+  r_seed_hex=$(python3 -c "import os; print(os.urandom(32).hex().upper())")
+  r_seed_b64=$(python3 -c "import base64,os; print(base64.b64encode(bytes.fromhex('${r_seed_hex}')).decode())")
+  log "r_seed: ${r_seed_hex}"
+
+  # Send BF46 { 80 r_seed } to eUICC — derive session key
+  local bf46_resp
+  bf46_resp=$(phase0_apdu "46" "${r_seed_hex}")
+  # Extract pk_U (field 80), π_bind (field 81), H(σ_EID) (field 82) from BF46 response
+  local pk_u_b64 pi_bind_b64 h_sigma_eid_b64
+  read -r pk_u_b64 pi_bind_b64 h_sigma_eid_b64 < <(echo "${bf46_resp}" | python3 -c "
+import sys, base64
+
+def rlen(d, p):
+    b = d[p]
+    if b <= 0x7F: return b, p + 1
+    if b == 0x81: return d[p+1], p + 2
+    if b == 0x82: return (d[p+1] << 8) | d[p+2], p + 3
+    raise ValueError(f'bad len 0x{b:02X}')
+
+resp = sys.stdin.read().strip()
+data = bytes.fromhex(resp)
+pos = 0
+assert data[pos] == 0xBF and data[pos+1] == 0x46, 'Expected BF46'
+pos += 2
+_, pos = rlen(data, pos)           # skip outer length
+assert data[pos] == 0xA0, 'Expected A0'
+pos += 1
+_, pos = rlen(data, pos)           # skip A0 length
+fields = {}
+while pos < len(data):
+    tag = data[pos]; pos += 1
+    flen, pos = rlen(data, pos)
+    fields[tag] = data[pos:pos+flen]
+    pos += flen
+print(base64.b64encode(fields[0x80]).decode())
+print(base64.b64encode(fields[0x81]).decode())
+print(base64.b64encode(fields[0x82]).decode())
+")
+  log "pk_U       : ${pk_u_b64}"
+  log "π_bind     : ${pi_bind_b64}"
+  log "H(σ_EID)   : ${h_sigma_eid_b64}"
+
+  # Get PCert_U from PCA (MNO server); include H(σ_EID) so it is embedded in the cert
+  local cert_resp pcert_b64
+  cert_resp=$(mno_post "/zk-esim/v1/certInitRequest" \
+    "{\"pkU\":\"${pk_u_b64}\",\"piBind\":\"${pi_bind_b64}\",\"hSigmaEid\":\"${h_sigma_eid_b64}\"}")
+  pcert_b64=$(echo "${cert_resp}" | python3 -c "import sys,json; print(json.load(sys.stdin)['pCertU'])")
+  local pcert_hex
+  pcert_hex=$(python3 -c "import base64; print(base64.b64decode('${pcert_b64}').hex().upper())")
+  log "PCert_U: ${pcert_hex:0:40}…"
+
+  # Send BF47 { 80 PCert_U } to eUICC — install session cert
+  local bf47_resp
+  bf47_resp=$(phase0_apdu "47" "${pcert_hex}")
+  echo "${bf47_resp}" | python3 -c "
+import sys; data = bytes.fromhex(sys.stdin.read().strip())
+assert data[0] == 0xBF and data[1] == 0x47 and data[3] == 0xA0, 'BF47 failed'
+print('OK')
+" && ok "Phase 0.b complete — PCert_U installed; sk_U active." || { err "Phase 0.b failed."; exit 1; }
+}
+
+# ---------------------------------------------------------------------------
 # PHASE 2 — Test ZK-eSIM applet (ZK-eSIM APPLET AID)
 # ---------------------------------------------------------------------------
 phase2_test_applet() {
   banner "Phase 2 — Test ZK-eSIM Applet (ZK-eSIM Applet AID)"
 
-  stop_mno
   stop_smdpp
-  if [[ "${ZK_DOWNLOAD}" != "0" ]]; then
-    phase1_start_smdpp 1
-    phase1_start_mno
-  else
-    phase1_start_smdpp 0
-  fi
+  phase1_start_smdpp 1
 
   log "Switching to ZK-eSIM applet AID: ${INSTANCE_AID}"
   log "Setting LPAC_CUSTOM_ISD_R_AID=${INSTANCE_AID}"
@@ -554,35 +747,19 @@ phase2_test_applet() {
     fi
   }
 
-  if [[ "${ZK_DOWNLOAD}" != "0" ]]; then
-    log "Step 2.1 — Exercising ZK Phase 1/2 and ES10 flow through the applet..."
-    log "  MNO server    : ${MNO_HOST}:${MNO_PORT}"
-    log "  SM-DP+ server : ${SMDPP_HOST}:${SMDPP_PORT}"
-    log "  This runs BF42 ZKProfileRequest, BF43 SetEligibilityData, then the standard ES10 download chain."
+  log "Step 2.1 — Exercising ES10 message flow through the applet..."
+  log "  The profile download command exercises the full ES10x chain:"
+  log "    BF2E GetEuiccChallenge → BF38 AuthenticateServer"
+  log "    BF21 PrepareDownload   → BF36 LoadBoundProfilePackage"
 
-    run_lpac profile zk-download \
-      -m "https://${MNO_HOST}:${MNO_PORT}" \
-      -d "https://${SMDPP_HOST}:${SMDPP_PORT}" \
-      -i "${MATCHING_ID}" \
-      --mno-cacert "${MNO_CACERT}" || {
-      warn "ZK profile download via applet AID returned non-zero."
-      exit 1
-    }
-  else
-    log "Step 2.1 — Exercising legacy ES10 message flow through the applet..."
-    log "  The profile download command exercises the full ES10x chain:"
-    log "    BF2E GetEuiccChallenge → BF38 AuthenticateServer"
-    log "    BF21 PrepareDownload   → BF36 LoadBoundProfilePackage"
-
-    # Re-run profile download targeting the applet as ISD-R.
-    # This verifies that each ES10 APDU is handled correctly by ZkEsimApplet.
-    log "Running profile download against applet (SM-DP+: ${SMDPP_HOST}, ID: ${MATCHING_ID})..."
-    run_lpac profile download \
-      -s "${SMDPP_HOST}" \
-      -m "${MATCHING_ID}" || {
-      warn "Profile download via applet AID returned non-zero (may be expected if profile already loaded)."
-    }
-  fi
+  # Re-run profile download targeting the applet as ISD-R.
+  # This verifies that each ES10 APDU is handled correctly by ZkEsimApplet.
+  log "Running profile download against applet (SM-DP+: ${SMDPP_HOST}, ID: ${MATCHING_ID})..."
+  run_lpac profile download \
+    -s "${SMDPP_HOST}" \
+    -m "${MATCHING_ID}" || {
+    warn "Profile download via applet AID returned non-zero (may be expected if profile already loaded)."
+  }
 
   # log "Step 2.2 — Listing profiles as seen through applet AID..."
   # run_lpac profile list || warn "Profile list returned non-zero (check applet state)."
@@ -596,18 +773,11 @@ phase2_test_applet() {
 main() {
   banner "ZK-eSIM End-to-End Workflow"
   log "Repository root : ${REPO_ROOT}"
-  log "Log directory   : ${LOG_DIR}"
   log "Matching ID     : ${MATCHING_ID}"
-  log "lpac build dir  : ${LPAC_BUILD_DIR}"
   log "lpac binary     : ${LPAC_BIN}"
-  log "Python          : $(command -v python)"
-  if [[ "${ZK_DOWNLOAD}" != "0" ]]; then
-    log "Second download : ZK/MNO through applet"
-  else
-    log "Second download : standard SGP.22 through applet"
-  fi
   log "SKIP_BUILD      : ${SKIP_BUILD}"
   log "SKIP_DOWNLOAD   : ${SKIP_DOWNLOAD}"
+  log "ZK_DOWNLOAD     : ${ZK_DOWNLOAD}"
 
   check_prereqs
   phase0_build_lpac
@@ -619,16 +789,43 @@ main() {
   fi
 
   if [[ "${SKIP_DOWNLOAD}" == "0" ]]; then
-    phase1_start_smdpp 0
-    phase1_download
+    if [[ "${ZK_DOWNLOAD}" == "1" ]]; then
+      # ZK path: SM-DP+ also serves MNO routes; start with --zk flag.
+      phase1_start_smdpp 1
+
+      local _t0 _t1
+      _t0=$(_ts_ms)
+      phase1_zk_download
+      _t1=$(_ts_ms)
+      T_ZK_DOWNLOAD_MS=$(( _t1 - _t0 ))
+      ok "ZK profile download took ${T_ZK_DOWNLOAD_MS} ms"
+
+      # Phase 0 is an integral part of the ZK flow: derive the session keypair
+      # (RegisterAndIssue + CertInit) so Phase 2 uses a fresh unlinkable key.
+      export LPAC_CUSTOM_ISD_R_AID="${INSTANCE_AID}"
+
+      _t0=$(_ts_ms)
+      phase0_register
+      _t1=$(_ts_ms)
+      T_REGISTER_MS=$(( _t1 - _t0 ))
+      ok "Registration took ${T_REGISTER_MS} ms"
+
+      _t0=$(_ts_ms)
+      phase0_certinit
+      _t1=$(_ts_ms)
+      T_CERTINIT_MS=$(( _t1 - _t0 ))
+      ok "Certificate init took ${T_CERTINIT_MS} ms"
+
+      unset LPAC_CUSTOM_ISD_R_AID
+    else
+      phase1_start_smdpp 0
+      phase1_download
+    fi
   else
     warn "Skipping profile download — SKIP_DOWNLOAD=1"
   fi
 
   phase2_test_applet
-
-  cleanup
-  trap - EXIT
 
   banner "Workflow Complete"
   ok "All phases passed successfully."
@@ -637,6 +834,10 @@ main() {
   echo -e "  Package AID  : ${BOLD}${LOAD_PACKAGE_AID}${RESET}"
   echo -e "  Applet AID   : ${BOLD}${INSTANCE_AID}${RESET}"
   echo
+
+  if [[ "${ZK_DOWNLOAD}" == "1" && "${SKIP_DOWNLOAD}" == "0" ]]; then
+    print_timing_summary
+  fi
 }
 
 main "$@"
