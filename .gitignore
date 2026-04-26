@@ -1,5 +1,5 @@
 /workdir
-
 .venv
-
 *.log
+__pycache__/
+.zkesim-workflow/logs/

@@ -1,6 +1,6 @@
 # ZK-eSIM End-to-End Workflow
 
-This document describes how to compile the ZK-eSIM JavaCard applet, install it inside an eSIM profile, download that profile to a physical eUICC chip, and verify the applet's ZK-proof message flow using lpac.
+This document describes how to compile the ZK-eSIM JavaCard applet, install it inside an eSIM profile, download that profile to a physical eUICC chip, and run the role-separated ZK-eSIM protocol with lpac, SM-DP+, MNO, and PCA services.
 
 ---
 
@@ -19,14 +19,12 @@ This document describes how to compile the ZK-eSIM JavaCard applet, install it i
 └──────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────┐
-│  Phase 2 — Test Applet (ZK-eSIM Applet AID)                  │
+│  ZK Phases — ZK-eSIM Applet AID                              │
 │                                                               │
-│   lpac  ──LPAC_CUSTOM_ISD_R_AID──►  ZkEsimApplet             │
-│  (ES10 APDUs via STORE DATA 80 E2)                            │
-│   BF2E GetEuiccChallenge                                      │
-│   BF38 AuthenticateServer  (includes ZK proof)                │
-│   BF21 PrepareDownload                                        │
-│   BF36 LoadBoundProfilePackage                                │
+│   lpac zk-register  ◄──► MNO 4443 ◄──► ZkEsimApplet BF44/45  │
+│   lpac zk-certinit  ◄──► PCA 5443 ◄──► ZkEsimApplet BF46/47  │
+│   lpac zk-order     ◄──► MNO 4443 ◄──► ZkEsimApplet BF42/43  │
+│   lpac zk-download  ◄──► SM-DP+ 443 ◄──► ZkEsimApplet ES10   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,11 +36,18 @@ This document describes how to compile the ZK-eSIM JavaCard applet, install it i
 |---|---|
 | Java 17 | `/usr/lib/jvm/java-17-openjdk-amd64` on Linux |
 | Apache Ant | `sudo apt install ant` |
-| Python 3 | `sudo apt install python3` |
+| Python 3 + pysim environment | Activate the project Python environment before running the workflow |
+| CMake + compiler | Build lpac on Linux or macOS |
+| OpenSSL | Certificate generation and TLS helpers |
+| `lsof` | Preferred for portable port checks; workflow has fallbacks |
 | pcscd + pcsc-lite | `sudo apt install pcscd libpcsclite-dev` |
 | libcurl | `sudo apt install libcurl4-openssl-dev` |
 | lpac built | `cd lpac && cmake -B build && cmake --build build` |
 | Git submodules initialised | `git submodule update --init --recursive` |
+
+On macOS, install the equivalent tools with Homebrew, for example `bash`,
+`python3`, `cmake`, `openssl`, `lsof`, and the PC/SC dependencies required by
+your reader.
 
 TLS certificates for osmo-smdpp must be present at:
 ```
@@ -198,7 +203,7 @@ export LPAC_HTTP=curl
 
 ---
 
-## Phase 2 — Test ZK-eSIM Applet (ZK-eSIM Applet AID)
+## ZK Phases — Role-Separated Protocol
 
 ### Why a different AID
 
@@ -211,8 +216,8 @@ D07002CA44900101
 To send ES10 APDUs directly to the applet (rather than to the chip's ISD-R), lpac must open a logical channel to this AID. This is done via the `LPAC_CUSTOM_ISD_R_AID` environment variable.
 
 ```
-Default ISD-R:  A0000005591010FFFFFFFF8900000100  ← used in Phase 1
-ZK-eSIM applet: D07002CA44900101                  ← used in Phase 2
+Default ISD-R:  A0000005591010FFFFFFFF8900000100  ← used for prerequisite download
+ZK-eSIM applet: D07002CA44900101                  ← used for phases 0-4
 ```
 
 ### APDU construction by lpac
@@ -225,14 +230,13 @@ lpac uses `STORE DATA (CLA=0x80, INS=0xE2)` APDUs to deliver DER-encoded ES10 me
 
 The applet responds with `61 XX` if more data follows; lpac then issues `GET RESPONSE (00 C0 00 00 Le)` to retrieve the full response.
 
-### ZK-proof in AuthenticateServer (BF38)
+### Role servers
 
-The `AuthenticateServer` response from `ZkEsimApplet` includes a Schnorr-style zero-knowledge proof:
-
-- **Commitment** `T = r·G` (random EC point)
-- **Response** `s = r + c·w mod n`
-
-This proves the applet holds the witness `w` (derived from the device key + EID) without revealing it.
+| Role | Script | Default |
+|---|---|---|
+| SM-DP+ | `pysim/osmo-smdpp.py --zk` | `testsmdpplus1.example.com:443` |
+| MNO | `pysim/mno-server.py` | `localhost:4443` |
+| PCA | `pysim/pca-server.py` | `localhost:5443` |
 
 ### Manual steps
 
@@ -241,29 +245,27 @@ export LPAC_APDU=pcsc
 export LPAC_HTTP=curl
 export LPAC_CUSTOM_ISD_R_AID=D07002CA44900101   # ← ZK-eSIM applet AID
 
-# Step 1: verify the applet is selectable
-./lpac/build/src/lpac chip info
+# Phase 0: RegisterAndIssue with the MNO
+./lpac/build/src/lpac profile zk-register -n localhost:4443
 
-# Step 2: exercise the full ES10 message flow through the applet
-./lpac/build/src/lpac profile download \
-  -s "testsmdpplus1.example.com" \
-  -m "zkesimTest"
+# Phase 1: CertInit with the PCA
+./lpac/build/src/lpac profile zk-certinit -p localhost:5443
 
-# Step 3: list profiles as seen through the applet
+# Phase 2: ZKRequest + OrderProfile with the MNO
+./lpac/build/src/lpac profile zk-order -n localhost:4443
+
+# Phase 3: Profile download with SM-DP+
+./lpac/build/src/lpac profile zk-download \
+  -s testsmdpplus1.example.com \
+  -m zkesimTest
+
+# Phase 4: verify installation
 ./lpac/build/src/lpac profile list
 ```
 
-lpac internally calls, in order:
-
-| lpac function | APDU tag | Description |
-|---|---|---|
-| `es10b_get_euicc_challenge` | BF2E | Request 16-byte random challenge |
-| `es9p_initiate_authentication` | — | ES9+ HTTP to SM-DP+ |
-| `es10b_authenticate_server` | BF38 | Verify server cert; generate ZK proof |
-| `es9p_authenticate_client` | — | ES9+ HTTP |
-| `es10b_prepare_download` | BF21 | Negotiate session keys |
-| `es9p_get_bound_profile_package` | — | ES9+ HTTP — fetch encrypted profile |
-| `es10b_load_bound_profile_package` | BF36 | Install profile elements |
+The automated workflow runs these steps after the prerequisite normal profile
+download unless `SKIP_DOWNLOAD=1`. Logs are written under
+`.zkesim-workflow/logs/` by default.
 
 ---
 
@@ -277,12 +279,16 @@ lpac internally calls, in order:
 | `INSTANCE_AID` | `D07002CA44900101` | 1, 2 | Applet instance AID |
 | `PYSIM_ROOT` | `../pysim` | 1 | Path to pysim repository |
 | `INSTALL_TO_SMDPP_UPP` | `0` | 1 | Copy profile to SM-DP+ UPP directory |
-| `LPAC_APDU` | `pcsc` | 1, 2 | lpac APDU backend |
-| `LPAC_HTTP` | `curl` | 1, 2 | lpac HTTP backend |
-| `LPAC_CUSTOM_ISD_R_AID` | *(unset = default ISD-R)* | 2 | Override ISD-R AID for applet testing |
-| `LPAC_CUSTOM_ES10X_MSS` | `120` | 1, 2 | ES10 max APDU segment size (6–256) |
-| `LPAC_APDU_DEBUG` | `false` | 1, 2 | Log raw APDU bytes |
-| `LPAC_HTTP_DEBUG` | `false` | 1, 2 | Log raw HTTP traffic |
+| `SMDPP_HOST` / `SMDPP_PORT` | `testsmdpplus1.example.com` / `443` | all | SM-DP+ role address |
+| `MNO_HOST` / `MNO_PORT` | `localhost` / `4443` | 0, 2 | MNO role address |
+| `PCA_HOST` / `PCA_PORT` | `localhost` / `5443` | 1 | PCA role address |
+| `WORKFLOW_LOG_DIR` | `.zkesim-workflow/logs` | all | Default directory for SM-DP+, MNO, PCA, and lpac logs |
+| `LPAC_APDU` | `pcsc` | all | lpac APDU backend |
+| `LPAC_HTTP` | `curl` | all | lpac HTTP backend |
+| `LPAC_CUSTOM_ISD_R_AID` | *(unset = default ISD-R)* | ZK phases | Override ISD-R AID for applet testing |
+| `LPAC_CUSTOM_ES10X_MSS` | `120` | all | ES10 max APDU segment size (6–256) |
+| `LPAC_APDU_DEBUG` | `false` | all | Log raw APDU bytes |
+| `LPAC_HTTP_DEBUG` | `false` | all | Log raw HTTP traffic |
 
 ---
 

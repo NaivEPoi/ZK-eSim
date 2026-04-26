@@ -74,10 +74,12 @@ PCA_HOST="${PCA_HOST:-localhost}"
 PCA_PORT="${PCA_PORT:-5443}"
 ZK_PHASE_TIMEOUT="${ZK_PHASE_TIMEOUT:-180}"
 ZK_APDU_DEBUG="${ZK_APDU_DEBUG:-1}"
-SMDPP_LOG="${SMDPP_LOG:-${REPO_ROOT}/smdpp.log}"
-MNO_LOG="${MNO_LOG:-${REPO_ROOT}/mno.log}"
-PCA_LOG="${PCA_LOG:-${REPO_ROOT}/pca.log}"
-ZK_LPAC_LOG="${ZK_LPAC_LOG:-${REPO_ROOT}/zk-lpac.log}"
+WORKFLOW_LOG_DIR="${WORKFLOW_LOG_DIR:-${REPO_ROOT}/.zkesim-workflow/logs}"
+SMDPP_LOG="${SMDPP_LOG:-${WORKFLOW_LOG_DIR}/smdpp.log}"
+MNO_LOG="${MNO_LOG:-${WORKFLOW_LOG_DIR}/mno.log}"
+PCA_LOG="${PCA_LOG:-${WORKFLOW_LOG_DIR}/pca.log}"
+ZK_LPAC_LOG="${ZK_LPAC_LOG:-${WORKFLOW_LOG_DIR}/zk-lpac.log}"
+mkdir -p "${WORKFLOW_LOG_DIR}"
 
 # Export lpac backend settings (used in both phases)
 export LPAC_APDU="${LPAC_APDU:-pcsc}"
@@ -818,50 +820,6 @@ for p in data.get('payload', {}).get('data', []):
   fi
 
   ok "Phase 4 complete — profile installed in eUICC."
-}
-
-# ---------------------------------------------------------------------------
-# Helper: send a Phase 0 APDU via lpac and return the response hex
-# ---------------------------------------------------------------------------
-phase0_apdu() {
-  local tag="$1"   # BF44 / BF45 / BF46 / BF47
-  local payload_hex="$2"
-  # Build TLV: BF_TAG { 80 LL <payload> }
-  local payload_len_hex
-  payload_len_hex=$(printf '%02X' $((${#payload_hex} / 2)))
-  local tlv_hex="${tag}$(python3 -c "
-n = ${#payload_hex} // 2
-if n < 128:
-    print(f'{n:02X}')
-elif n < 256:
-    print(f'81{n:02X}')
-else:
-    print(f'82{n>>8:02X}{n&0xFF:02X}')
-")80${payload_len_hex}${payload_hex}"
-  # STORE DATA: 80 E2 91 00 LL <tlv>
-  local lc_hex
-  lc_hex=$(printf '%02X' $((${#tlv_hex} / 2)))
-  local apdu_hex="80E291000${lc_hex}${tlv_hex}"
-  log "Phase0 APDU TX: ${apdu_hex}"
-  local resp
-  resp=$(LPAC_APDU="${LPAC_APDU}" LPAC_HTTP="${LPAC_HTTP}" \
-    LPAC_CUSTOM_ISD_R_AID="${INSTANCE_AID}" \
-    "${LPAC_BIN}" apdu "${apdu_hex}" 2>&1)
-  log "Phase0 APDU RX: ${resp}"
-  echo "${resp}"
-}
-
-# ---------------------------------------------------------------------------
-# Helper: POST JSON to MNO endpoint, return response body
-# ---------------------------------------------------------------------------
-mno_post() {
-  local endpoint="$1"
-  local body="$2"
-  curl -s -X POST \
-    -H "Content-Type: application/json" \
-    --data "${body}" \
-    "https://${MNO_HOST}:${MNO_PORT}${endpoint}" \
-    --insecure 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
