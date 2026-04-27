@@ -1,13 +1,26 @@
 # ZK eSIM Workflow and Component Changes
 
-This repository orchestrates a two-stage ZK eSIM prototype across three active
+This repository orchestrates a two-stage ZK eSIM prototype across four active
 components:
 
 - `ZK-eSIM_applet/` - JavaCard applet, jCardSim tests, CAP/profile builder
 - `lpac/` - LPA client with custom ES10 routing and ZK profile commands
 - `pysim/` - `osmo-smdpp.py`, MNO server, PCA server, and SAIP tooling
+- `OpenEUICC/` - Android LPA app wired to the custom lpac JNI path for
+  privileged ZK profile downloads
 
 The main automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
+
+## Anonymized Submodules
+
+This repository uses anonymized submodule remotes:
+
+| Path | Anonymized remote | Description |
+| --- | --- | --- |
+| `ZK-eSIM_applet/` | `https://anonymous.4open.science/r/ZK-eSIM_applet-BB53` | JavaCard ZK-eSIM applet and profile injection tooling |
+| `lpac/` | `https://anonymous.4open.science/r/lpac_ZK-B783` | Patched lpac client with custom ES10 routing and ZK profile commands |
+| `pysim/` | `https://anonymous.4open.science/r/ZK-eSIM-SMDP-02F2` | SM-DP+, MNO, PCA, and SAIP support code |
+| `OpenEUICC/` | `https://anonymous.4open.science/r/OpenEUICC_ZK-3F83` | Android privileged LPA integration using the ZK-enabled lpac JNI layer |
 
 ## End-to-End Flow
 
