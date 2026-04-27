@@ -1,123 +1,111 @@
 # ZK eSIM Workflow and Component Changes
 
-This repository orchestrates a two-phase ZK eSIM flow across three key components:
-- ZK-eSIM_applet (JavaCard applet)
-- lpac (LPA client / ES10 transport)
-- pysim osmo-smdpp.py (SM-DP+ server)
+This repository orchestrates a two-stage ZK eSIM prototype across three active
+components:
 
-The automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
+- `ZK-eSIM_applet/` - JavaCard applet, jCardSim tests, CAP/profile builder
+- `lpac/` - LPA client with custom ES10 routing and ZK profile commands
+- `pysim/` - `osmo-smdpp.py`, MNO server, PCA server, and SAIP tooling
 
-## End-to-end workflow
+The main automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
 
-### Phase 0: Build lpac
-- [zkesim_workflow.sh](zkesim_workflow.sh) configures and builds lpac using CMake.
-- It exports LD_LIBRARY_PATH so lpac runtime libraries are found.
+## End-to-End Flow
 
-### Phase 1a: Build applet and create profile
-- Runs [ZK-eSIM_applet/build_and_inject_profile.sh](ZK-eSIM_applet/build_and_inject_profile.sh).
-- Builds CAP from ZK-eSIM_applet sources.
-- Injects applet load package + applet instance into a SAIP profile DER.
-- Installs resulting DER into pysim UPP directory so SM-DP+ can serve it.
+The current workflow first installs the profile that contains the applet through
+the card's normal ISD-R, then talks directly to the applet AID for the ZK
+protocol and final profile download.
 
-### Phase 1b: Start SM-DP+
-- Starts [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py).
-- Normal mode for standard download in phase 1.
-- ZK mode in phase 2 (started with --zk).
+1. **Setup A: build lpac**
+   - Configures and builds `lpac` with CMake.
+   - Default build/output directories are under `/tmp/zkesim-workflow-$USER/`.
+   - Exports `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` for the installed lpac
+     libraries.
 
-### Phase 1c: Standard profile download to eUICC (default ISD-R)
-- Uses default ISD-R AID A0000005591010FFFFFFFF8900000100.
-- Performs standard SGP.22 profile download via lpac + ES9+.
-- Includes card resource diagnostics and optional profile cleanup/reset flow from script.
+2. **Setup B: build applet and create profile**
+   - Runs [ZK-eSIM_applet/build_and_inject_profile.sh](ZK-eSIM_applet/build_and_inject_profile.sh).
+   - Builds `dist/ZkEsimApplet.cap`.
+   - Injects the load package and applet instance into a SAIP profile DER.
+   - Copies the generated DER into `pysim/smdpp-data/upp/${MATCHING_ID}.der`.
 
-### Phase 2: ZK applet routing and validation
-- Sets LPAC_CUSTOM_ISD_R_AID to the applet instance AID.
-- Replays the ES10 message path through ZkEsimApplet:
-  - BF2E GetEuiccChallenge
-  - BF38 AuthenticateServer
-  - BF21 PrepareDownload
-  - BF36 LoadBoundProfilePackage
-- In this phase, the workflow restarts osmo-smdpp.py in ZK mode.
+3. **Prerequisite standard download**
+   - Starts `pysim/osmo-smdpp.py` in normal mode.
+   - Uses the default ISD-R AID `A0000005591010FFFFFFFF8900000100`.
+   - Downloads/enables the profile so the ZK-eSIM applet becomes selectable.
 
-## What changed in lpac
+4. **Role-separated ZK phases**
+   - Restarts SM-DP+ with `--zk`.
+   - Starts `pysim/mno-server.py` and `pysim/pca-server.py`.
+   - Sets `LPAC_CUSTOM_ISD_R_AID` to the applet instance AID
+     `D07002CA44900101`.
+   - Runs:
+     - `lpac profile zk-register` for RegisterAndIssue (`BF44` / `BF45`)
+     - `lpac profile zk-certinit` for pseudonym certificate issuance (`BF46` / `BF47`)
+     - `lpac profile zk-order` for ZKRequest and MNO order/confirm (`BF42` / `BF43`)
+     - `lpac profile zk-download` for the final ES9+/ES10 profile download
 
-### 1) Proprietary response chaining support (91xx)
-- [lpac/euicc/interface.private.h](lpac/euicc/interface.private.h#L11) adds SW1_LAST_PROP = 0x91.
-- [lpac/euicc/euicc.c](lpac/euicc/euicc.c#L36) treats both 61xx and 91xx as "more response data", issuing GET RESPONSE until complete.
-- This is needed because the applet uses proprietary 91xx chaining behavior.
+## Current Applet Surface
 
-### 2) Selectable target AID via env var
-- [lpac/src/main.c](lpac/src/main.c#L34) and [lpac/src/main.c](lpac/src/main.c#L77) support LPAC_CUSTOM_ISD_R_AID with default fallback to the standard ISD-R AID.
-- This enables switching between:
-  - standard ISD-R for normal profile install
-  - ZK applet AID for direct applet routing tests
+`ZkEsimApplet` dispatches ES10 transport APDUs (`STORE DATA`, `INS=E2`) for:
 
-### 3) Custom ES10 segment size and debug hooks
-- [lpac/src/main.c](lpac/src/main.c#L38) supports LPAC_CUSTOM_ES10X_MSS.
-- [lpac/src/main.c](lpac/src/main.c#L32) and [lpac/docs/ENVVARS.md](lpac/docs/ENVVARS.md#L5) expose APDU/HTTP debug and custom env knobs.
+- `BF20` GetEuiccInfo1
+- `BF2E` GetEuiccChallenge
+- `BF38` AuthenticateServer
+- `BF21` PrepareDownload
+- `BF36` LoadBoundProfilePackage
+- `BF41` CancelSession
+- `BF42` ZKProfileRequest
+- `BF43` SetEligibilityData
+- `BF44` / `BF45` RegisterAndIssue
+- `BF46` / `BF47` CertInit
 
-## What changed in SM-DP+ (osmo-smdpp.py)
+Large outbound responses use proprietary `91xx` response chaining. Hosts should
+treat `91xx` like `61xx`: issue `GET RESPONSE (00 C0 00 00 Le)` using `SW2` as
+the next length hint. This avoids a real-card T=0 runtime issue seen with `61xx`
+on transport CLA `0x81`.
 
-### 1) ZK mode flag and server wiring
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L1136) adds -z/--zk CLI flag.
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L526) carries zk_mode into server instance.
+## lpac Changes
 
-### 2) ZK-specific BF38 parsing path
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L572) adds _parse_authenticate_server_response_zk.
-- It parses AuthenticateServerResponse in a way that avoids strict embedded cert decoding issues and retains euiccSigned1_bin for signature verification.
+- `LPAC_CUSTOM_ISD_R_AID` selects the logical-channel target AID. Leave it unset
+  for the prerequisite ISD-R download; set it to `D07002CA44900101` for ZK applet
+  phases.
+- `LPAC_CUSTOM_ES10X_MSS` overrides the ES10 segment size.
+- `LPAC_APDU_DEBUG` and `LPAC_HTTP_DEBUG` enable APDU/HTTP traces.
+- `euicc.c` handles both standard `61xx` and proprietary `91xx` response
+  chaining.
+- Four profile subcommands implement the ZK path:
+  `zk-register`, `zk-certinit`, `zk-order`, and `zk-download`.
 
-### 3) Eligibility bundle validation in authenticateClient
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L829) requires eligibilityData in zk mode.
-- Enforces token expiry checks using decode_expiry.
-- Verifies:
-  - sigCred over (hpid, h_cert, mnoid)
-  - sigRoot over accumulator root
-  - inclusion proof against accumulator root
-- Consumes/records authorization token state after validation.
+## pysim Changes
 
-### 4) Session and output extensions in zk mode
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L190) uses setupMNOValues for session initialization.
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L731) returns zkAuthTokenExpiry when present.
-- In getBoundProfilePackage, zk mode derives BSP session keys from ECDH shared secret instead of static placeholders.
+- `osmo-smdpp.py --zk` enables eligibility validation during
+  `authenticateClient`.
+- In ZK mode, SM-DP+ verifies `euiccSignature1`, validates raw 64-byte MNO
+  signatures (`r||s`) over the credential/root/token payloads, checks token
+  expiry, verifies the accumulator inclusion proof, and spends each auth token
+  once.
+- SM-DP+ exposes ES2+ `downloadOrder`, `confirmOrder`, and `releaseProfile`
+  routes used by the MNO role.
+- `mno-server.py` handles MNO challenge, blind credential issuance, BF42 proof
+  verification, ES2+ order/confirm, and BF43 eligibility-data generation.
+- `pca-server.py` handles CertInit, verifies the binding signature, and issues
+  `PCert_U`.
 
-## What is implemented in ZK-eSIM applet
-
-### Command decode and dispatch
-- [ZK-eSIM_applet/src/zk/esim/applet/Asn1.java](ZK-eSIM_applet/src/zk/esim/applet/Asn1.java#L18) defines TYPE_GET_EUICC_INFO1_REQUEST for BF20.
-- [ZK-eSIM_applet/src/zk/esim/applet/Asn1.java](ZK-eSIM_applet/src/zk/esim/applet/Asn1.java#L141) decodes BF20 requests.
-- [ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java](ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java#L253) dispatches BF20/BF2E/BF21/BF36/BF38/BF41 handlers.
-
-### GetEuiccInfo1 (BF20)
-- [ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java](ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java#L426) builds BF20 response.
-- Returns SVN and CI PKID lists for verification/signing (A9 and AA lists).
-
-### AuthenticateServer response with ZK extension (BF38)
-- [ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java](ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java#L570) includes eligibilityData as A5 with fields 80..85:
-  - hpid
-  - sigCred
-  - authToken
-  - accRoot
-  - sigRoot
-  - accProof
-- BF38 response includes EuiccSigned1 plus signature in application tag 55.
-- Current implementation emits empty placeholder cert sequences after signature.
-
-### Session/state handling and response staging
-- Tracks challenge + transaction state for request coherence and cancel/load behaviors.
-- Handles APDU segmentation ingest and staged response emission through internal handlers.
-- Supports profile installation result generation and session cleanup.
-
-## Key scripts
-- [zkesim_workflow.sh](zkesim_workflow.sh): Main end-to-end flow.
-- [algtest_workflow.sh](algtest_workflow.sh): Alternate workflow for AlgTest CAP packaging/download and smoke testing.
-- [generate_test_values.py](generate_test_values.py): Generates deterministic ZK-related test constants.
-- [ZKESIM_WORKFLOW.md](ZKESIM_WORKFLOW.md): Detailed narrative workflow doc.
-
-## Typical run
+## Typical Run
 
 ```bash
 bash zkesim_workflow.sh
 ```
 
-Useful toggles:
-- SKIP_BUILD=1 bash zkesim_workflow.sh
-- SKIP_BUILD=1 SKIP_DOWNLOAD=1 bash zkesim_workflow.sh
+Useful variants:
+
+```bash
+SKIP_BUILD=1 bash zkesim_workflow.sh
+SKIP_BUILD=1 SKIP_DOWNLOAD=1 bash zkesim_workflow.sh
+bash zkesim_workflow.sh --standard-download
+bash zkesim_workflow.sh --applet-smoke
+```
+
+Workflow logs are written to `.zkesim-workflow/logs/` by default.
+
+For the detailed phase-by-phase runbook, see
+[ZKESIM_WORKFLOW.md](ZKESIM_WORKFLOW.md).
