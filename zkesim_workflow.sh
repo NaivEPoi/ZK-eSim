@@ -27,7 +27,6 @@
 #   PHASE2_APDU_DEBUG    Set to 1 to print raw APDU trace in optional applet smoke test (default: 1)
 #   ZK_DOWNLOAD          Set to 1 to use the full ZK path (default: 1)
 #   RUN_APPLET_SMOKE     Set to 1 to run the old applet smoke-test download after the workflow (default: 0)
-#   ZK_PHASE_TIMEOUT     Seconds before a ZK lpac phase is considered hung (default: 180)
 #   ZK_APDU_DEBUG        Set to 1 to record APDU trace for ZK phases (default: 1)
 #   SMDPP_LOG/MNO_LOG/PCA_LOG/ZK_LPAC_LOG
 #                        Log files for protocol-role servers and ZK lpac phases
@@ -72,7 +71,6 @@ MNO_HOST="${MNO_HOST:-localhost}"
 MNO_PORT="${MNO_PORT:-4443}"
 PCA_HOST="${PCA_HOST:-localhost}"
 PCA_PORT="${PCA_PORT:-5443}"
-ZK_PHASE_TIMEOUT="${ZK_PHASE_TIMEOUT:-180}"
 ZK_APDU_DEBUG="${ZK_APDU_DEBUG:-1}"
 WORKFLOW_LOG_DIR="${WORKFLOW_LOG_DIR:-${REPO_ROOT}/.zkesim-workflow/logs}"
 SMDPP_LOG="${SMDPP_LOG:-${WORKFLOW_LOG_DIR}/smdpp.log}"
@@ -117,77 +115,28 @@ dump_debug_logs() {
   done
 }
 
-run_logged_timeout() {
-  local timeout_s="$1"
-  local logfile="$2"
-  shift 2
-  local elapsed=0
+run_logged() {
+  local logfile="$1"
+  shift 1
 
   mkdir -p "$(dirname "${logfile}")"
   : >"${logfile}"
 
-  "$@" > >(tee -a "${logfile}") 2>&1 &
-  local pid=$!
-
-  while kill -0 "${pid}" 2>/dev/null; do
-    if (( elapsed >= timeout_s )); then
-      err "Command timed out after ${timeout_s}s: $*"
-      kill "${pid}" 2>/dev/null || true
-      sleep 1
-      kill -9 "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-      dump_debug_logs
-      return 124
-    fi
-    sleep 1
-    elapsed=$(( elapsed + 1 ))
-  done
-
-  local rc=0
-  if wait "${pid}" 2>/dev/null; then
-    rc=0
-  else
-    rc=$?
-  fi
-  return "${rc}"
+  "$@" > >(tee -a "${logfile}") 2>&1
 }
 
-run_capture_timeout() {
+run_capture() {
   local __out_var="$1"
-  local timeout_s="$2"
-  local logfile="$3"
-  shift 3
+  local logfile="$2"
+  shift 2
   local output_file="${logfile}.out"
-  local elapsed=0
 
   mkdir -p "$(dirname "${logfile}")"
   : >"${logfile}"
   : >"${output_file}"
 
-  "$@" >"${output_file}" 2>&1 &
-  local pid=$!
-
-  while kill -0 "${pid}" 2>/dev/null; do
-    if (( elapsed >= timeout_s )); then
-      err "Command timed out after ${timeout_s}s: $*"
-      kill "${pid}" 2>/dev/null || true
-      sleep 1
-      kill -9 "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
-      cat "${output_file}" | tee -a "${logfile}" || true
-      dump_debug_logs
-      return 124
-    fi
-    sleep 1
-    elapsed=$(( elapsed + 1 ))
-  done
-
   local rc=0
-  if wait "${pid}" 2>/dev/null; then
-    rc=0
-  else
-    rc=$?
-  fi
+  "$@" >"${output_file}" 2>&1 || rc=$?
   cat "${output_file}" | tee -a "${logfile}" || true
   printf -v "${__out_var}" '%s' "$(cat "${output_file}")"
   return "${rc}"
@@ -702,7 +651,7 @@ phase1_zk_order_profile() {
   local rc=0
   local order_output
   set +e
-  run_capture_timeout order_output "${ZK_PHASE_TIMEOUT}" "${ZK_LPAC_LOG}.phase2-order" \
+  run_capture order_output "${ZK_LPAC_LOG}.phase2-order" \
     env LPAC_APDU="${LPAC_APDU}" \
       LPAC_HTTP="${LPAC_HTTP}" \
       LPAC_APDU_DEBUG="${ZK_APDU_DEBUG}" \
@@ -766,7 +715,7 @@ phase1_zk_download_profile() {
   log "ZK lpac phase log: ${ZK_LPAC_LOG}.phase3-download"
   local rc=0
   set +e
-  run_logged_timeout "${ZK_PHASE_TIMEOUT}" "${ZK_LPAC_LOG}.phase3-download" \
+  run_logged "${ZK_LPAC_LOG}.phase3-download" \
     env LPAC_APDU="${LPAC_APDU}" \
       LPAC_HTTP="${LPAC_HTTP}" \
       LPAC_APDU_DEBUG="${ZK_APDU_DEBUG}" \
@@ -832,7 +781,7 @@ phase0_register() {
   export LPAC_CUSTOM_ISD_R_AID="${INSTANCE_AID}"
   log "Running: ${LPAC_BIN} profile zk-register -n ${mno_addr}"
   log "ZK lpac phase log: ${ZK_LPAC_LOG}.phase0-register"
-  run_logged_timeout "${ZK_PHASE_TIMEOUT}" "${ZK_LPAC_LOG}.phase0-register" \
+  run_logged "${ZK_LPAC_LOG}.phase0-register" \
     env LPAC_APDU="${LPAC_APDU}" \
       LPAC_HTTP="${LPAC_HTTP}" \
       LPAC_APDU_DEBUG="${ZK_APDU_DEBUG}" \
@@ -851,7 +800,7 @@ phase0_certinit() {
   export LPAC_CUSTOM_ISD_R_AID="${INSTANCE_AID}"
   log "Running: ${LPAC_BIN} profile zk-certinit -p ${pca_addr}"
   log "ZK lpac phase log: ${ZK_LPAC_LOG}.phase1-certinit"
-  run_logged_timeout "${ZK_PHASE_TIMEOUT}" "${ZK_LPAC_LOG}.phase1-certinit" \
+  run_logged "${ZK_LPAC_LOG}.phase1-certinit" \
     env LPAC_APDU="${LPAC_APDU}" \
       LPAC_HTTP="${LPAC_HTTP}" \
       LPAC_APDU_DEBUG="${ZK_APDU_DEBUG}" \
@@ -927,7 +876,6 @@ main() {
   log "SKIP_DOWNLOAD   : ${SKIP_DOWNLOAD}"
   log "ZK_DOWNLOAD     : ${ZK_DOWNLOAD}"
   log "RUN_APPLET_SMOKE: ${RUN_APPLET_SMOKE}"
-  log "ZK_PHASE_TIMEOUT: ${ZK_PHASE_TIMEOUT}s"
   log "ZK_APDU_DEBUG   : ${ZK_APDU_DEBUG}"
   log "SM-DP+ log      : ${SMDPP_LOG}"
   log "MNO log         : ${MNO_LOG}"
