@@ -68,6 +68,11 @@ err()  { echo -e "${RED}[ERROR ]${RESET} $*" >&2; }
 banner() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════${RESET}"; \
            echo -e "${BOLD}${CYAN}  $*${RESET}"; \
            echo -e "${BOLD}${CYAN}══════════════════════════════════════════════${RESET}\n"; }
+timestamp_ms() { date +%s%3N; }
+format_duration_ms() {
+  local elapsed_ms="${1:-0}"
+  printf "%d ms" "${elapsed_ms}"
+}
 
 # ---------------------------------------------------------------------------
 # Parse flags
@@ -169,7 +174,11 @@ phase0_build_lpac() {
   cmake -S "${REPO_ROOT}/lpac" -B "${REPO_ROOT}/lpac/build"
 
   log "Building lpac (jobs=${jobs})..."
-  cmake --build "${REPO_ROOT}/lpac/build" --target lpac -j "${jobs}"
+  # Build the binary plus the runtime-loaded APDU/HTTP driver plugins.
+  # Without the driver targets, lpac fails at runtime with "No APDU driver found".
+  cmake --build "${REPO_ROOT}/lpac/build" \
+    --target lpac driver_apdu_pcsc driver_apdu_stdio driver_http_curl driver_http_stdio \
+    -j "${jobs}"
 
   if [[ ! -f "${LPAC_BIN}" ]]; then
     err "lpac binary missing after build: ${LPAC_BIN}"
@@ -435,11 +444,26 @@ phase2_test_applet() {
   # Re-run profile download targeting the applet as ISD-R.
   # This verifies that each ES10 APDU is handled correctly by ZkEsimApplet.
   log "Running profile download against applet (SM-DP+: ${SMDPP_HOST}, ID: ${MATCHING_ID})..."
+  local download_rc=0
+  local download_start_ms
+  local download_end_ms
+  local download_elapsed_ms
+  local download_elapsed
+  download_start_ms=$(timestamp_ms)
+  set +e
   run_lpac profile download \
     -s "${SMDPP_HOST}" \
-    -m "${MATCHING_ID}" || {
-    warn "Profile download via applet AID returned non-zero (may be expected if profile already loaded)."
-  }
+    -m "${MATCHING_ID}"
+  download_rc=$?
+  set -e
+  download_end_ms=$(timestamp_ms)
+  download_elapsed_ms=$((download_end_ms - download_start_ms))
+  download_elapsed=$(format_duration_ms "${download_elapsed_ms}")
+  if [[ "${download_rc}" != "0" ]]; then
+    warn "Profile download via applet AID returned non-zero after ${download_elapsed} (may be expected if profile already loaded)."
+  else
+    ok "Profile download via applet AID complete in ${download_elapsed}."
+  fi
 
   # log "Step 2.2 — Listing profiles as seen through applet AID..."
   # run_lpac profile list || warn "Profile list returned non-zero (check applet state)."

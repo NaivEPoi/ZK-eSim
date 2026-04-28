@@ -1,6 +1,6 @@
 # ZK-eSIM End-to-End Workflow
 
-This document describes how to compile the ZK-eSIM JavaCard applet, install it inside an eSIM profile, download that profile to a physical eUICC chip, and verify the applet's ZK-proof message flow using lpac.
+This document describes how to compile the ZK-eSIM JavaCard applet, install it inside an eSIM profile, download that profile to a physical eUICC chip, and exercise a standard SGP.22 download routed through the applet using lpac.
 
 ---
 
@@ -24,7 +24,7 @@ This document describes how to compile the ZK-eSIM JavaCard applet, install it i
 │   lpac  ──LPAC_CUSTOM_ISD_R_AID──►  ZkEsimApplet             │
 │  (ES10 APDUs via STORE DATA 80 E2)                            │
 │   BF2E GetEuiccChallenge                                      │
-│   BF38 AuthenticateServer  (includes ZK proof)                │
+│   BF38 AuthenticateServer                                     │
 │   BF21 PrepareDownload                                        │
 │   BF36 LoadBoundProfilePackage                                │
 └──────────────────────────────────────────────────────────────┘
@@ -225,14 +225,11 @@ lpac uses `STORE DATA (CLA=0x80, INS=0xE2)` APDUs to deliver DER-encoded ES10 me
 
 The applet responds with `61 XX` if more data follows; lpac then issues `GET RESPONSE (00 C0 00 00 Le)` to retrieve the full response.
 
-### ZK-proof in AuthenticateServer (BF38)
+### AuthenticateServer (BF38)
 
-The `AuthenticateServer` response from `ZkEsimApplet` includes a Schnorr-style zero-knowledge proof:
+The `AuthenticateServer` response from `ZkEsimApplet` is a stock SGP.22 `EuiccSigned1` (transactionId, serverAddress, serverChallenge, euiccInfo2, ctxParams1) wrapped with the application-tag-55 ECDSA signature, followed by the eUICC and EUM certificate slots.
 
-- **Commitment** `T = r·G` (random EC point)
-- **Response** `s = r + c·w mod n`
-
-This proves the applet holds the witness `w` (derived from the device key + EID) without revealing it.
+The applet emits a self-signed eUICC certificate, so the SM-DP+ runs in `--zk` mode to skip CI/EUM chain validation while still verifying `euiccSignature1` over `euiccSigned1`.
 
 ### Manual steps
 
@@ -259,7 +256,7 @@ lpac internally calls, in order:
 |---|---|---|
 | `es10b_get_euicc_challenge` | BF2E | Request 16-byte random challenge |
 | `es9p_initiate_authentication` | — | ES9+ HTTP to SM-DP+ |
-| `es10b_authenticate_server` | BF38 | Verify server cert; generate ZK proof |
+| `es10b_authenticate_server` | BF38 | Verify server cert; sign euiccSigned1 |
 | `es9p_authenticate_client` | — | ES9+ HTTP |
 | `es10b_prepare_download` | BF21 | Negotiate session keys |
 | `es9p_get_bound_profile_package` | — | ES9+ HTTP — fetch encrypted profile |
@@ -311,10 +308,10 @@ lpac internally calls, in order:
 - Enable the profile: `sudo LPAC_APDU=pcsc LPAC_HTTP=curl ./lpac/build/src/lpac profile enable <ICCID>`
 - Verify `LPAC_CUSTOM_ISD_R_AID` matches the installed instance AID exactly.
 
-### ZK proof verification fails
+### AuthenticateServer (BF38) verification fails
 
 - Enable APDU debug logging: `LPAC_APDU_DEBUG=true`
-- Check `AuthenticateServer` (BF38) response contains both the commitment `T` and response scalar `s`.
+- Confirm the SM-DP+ logs show successful `euiccSignature1` verification over `euiccSigned1`.
 - Run unit tests in `ZK-eSIM_applet/test/` with jCardSim for isolated applet testing.
 
 ---
@@ -323,7 +320,7 @@ lpac internally calls, in order:
 
 | Component | Path | Role |
 |---|---|---|
-| ZK-eSIM Applet | `ZK-eSIM_applet/` | JavaCard applet with ZK proof logic |
+| ZK-eSIM Applet | `ZK-eSIM_applet/` | JavaCard applet implementing the SGP.22 ES10 message flow |
 | Build script | `ZK-eSIM_applet/build_and_inject_profile.sh` | Compile CAP + create SAIP profile |
 | Profile tool | `pysim/contrib/saip-tool.py` | Inject applet into `.der` profile |
 | SM-DP+ server | `pysim/osmo-smdpp.py` | Serve profiles via SGP.22 ES9+ |

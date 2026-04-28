@@ -58,26 +58,14 @@ The automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
 ## What changed in SM-DP+ (osmo-smdpp.py)
 
 ### 1) ZK mode flag and server wiring
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L1136) adds -z/--zk CLI flag.
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L526) carries zk_mode into server instance.
+- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py) adds -z/--zk CLI flag and carries zk_mode into the server instance.
 
-### 2) ZK-specific BF38 parsing path
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L572) adds _parse_authenticate_server_response_zk.
-- It parses AuthenticateServerResponse in a way that avoids strict embedded cert decoding issues and retains euiccSigned1_bin for signature verification.
+### 2) Chain-skip for self-signed applet certificates
+- In zk mode, the SM-DP+ skips EUM/CI certificate-chain validation since the applet emits a self-signed eUICC cert without an EUM issuer.
+- The standard SGP.22 euiccSignature1-over-euiccSigned1 verification still runs in both modes.
 
-### 3) Eligibility bundle validation in authenticateClient
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L829) requires eligibilityData in zk mode.
-- Enforces token expiry checks using decode_expiry.
-- Verifies:
-  - sigCred over (hpid, h_cert, mnoid)
-  - sigRoot over accumulator root
-  - inclusion proof against accumulator root
-- Consumes/records authorization token state after validation.
-
-### 4) Session and output extensions in zk mode
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L190) uses setupMNOValues for session initialization.
-- [pysim/osmo-smdpp.py](pysim/osmo-smdpp.py#L731) returns zkAuthTokenExpiry when present.
-- In getBoundProfilePackage, zk mode derives BSP session keys from ECDH shared secret instead of static placeholders.
+### 3) ECDH-derived BSP session keys
+- In getBoundProfilePackage, zk mode derives BSP session keys (s_enc, s_mac, initial_mcv) from the ECDH shared secret using `bsp_key_derivation`, instead of static placeholders.
 
 ## What is implemented in ZK-eSIM applet
 
@@ -90,16 +78,9 @@ The automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
 - [ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java](ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java#L426) builds BF20 response.
 - Returns SVN and CI PKID lists for verification/signing (A9 and AA lists).
 
-### AuthenticateServer response with ZK extension (BF38)
-- [ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java](ZK-eSIM_applet/src/zk/esim/applet/ZkEsimApplet.java#L570) includes eligibilityData as A5 with fields 80..85:
-  - hpid
-  - sigCred
-  - authToken
-  - accRoot
-  - sigRoot
-  - accProof
-- BF38 response includes EuiccSigned1 plus signature in application tag 55.
-- Current implementation emits empty placeholder cert sequences after signature.
+### AuthenticateServer (BF38)
+- BF38 response is a stock SGP.22 EuiccSigned1 (transactionId / serverAddress / serverChallenge / euiccInfo2 / ctxParams1) plus the application-tag-55 ECDSA signature.
+- The applet's self-signed eUICC and EUM certificate slots are emitted after the signature so the standard ASN.1 decoder accepts the response.
 
 ### Session/state handling and response staging
 - Tracks challenge + transaction state for request coherence and cancel/load behaviors.
@@ -109,7 +90,6 @@ The automation entry point is [zkesim_workflow.sh](zkesim_workflow.sh).
 ## Key scripts
 - [zkesim_workflow.sh](zkesim_workflow.sh): Main end-to-end flow.
 - [algtest_workflow.sh](algtest_workflow.sh): Alternate workflow for AlgTest CAP packaging/download and smoke testing.
-- [generate_test_values.py](generate_test_values.py): Generates deterministic ZK-related test constants.
 - [ZKESIM_WORKFLOW.md](ZKESIM_WORKFLOW.md): Detailed narrative workflow doc.
 
 ## Typical run
